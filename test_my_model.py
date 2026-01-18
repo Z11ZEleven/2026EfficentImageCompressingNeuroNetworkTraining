@@ -14,6 +14,29 @@ from compressai.zoo import image_models
 from compressai.ops import compute_padding
 import torch.nn.functional as F
 
+def extract_epoch_from_checkpoint(checkpoint_path):
+    """从checkpoint文件名中提取epoch信息，保留前导零（如果有）"""
+    import re
+    from pathlib import Path
+    
+    filename = Path(checkpoint_path).name
+    
+    # 匹配 checkpoint_epoch_020.pth.tar 或 checkpoint_epoch_200.pth.tar
+    # 我们使用正则表达式来提取下划线后、点之前的数字部分
+    match = re.search(r'epoch_(\d+)\.pth\.tar$', filename)
+    if match:
+        # 返回匹配的数字字符串，保留前导零
+        return match.group(1)
+    
+    # 对于其他命名模式，比如 checkpoint_best_loss.pth.tar 或 checkpoint.pth.tar
+    if 'best_loss' in filename:
+        return "best"
+    elif filename == 'checkpoint.pth.tar':
+        return "final"
+    
+    # 如果都没有匹配到，返回文件名（不含扩展名）
+    return Path(checkpoint_path).stem
+
 def load_image(filepath: str) -> Image.Image:
     """加载图像"""
     return Image.open(filepath).convert("RGB")
@@ -59,16 +82,33 @@ def load_custom_model(model_arch, checkpoint_path, quality=3, metric="mse", devi
     if list(state_dict.keys())[0].startswith('module.'):
         state_dict = {k[7:]: v for k, v in state_dict.items()}
     
+# 修改后的 load_custom_model 函数尾部
     net.load_state_dict(state_dict)
     net.eval()
+    
+    # ===== 新增关键代码：更新熵模型 =====
+    # 方法1：针对大多数CompressAI图像模型
+    if hasattr(net, 'entropy_bottleneck'):
+        net.entropy_bottleneck.update()
+    # 方法2：更通用的方式，确保所有熵瓶颈层都更新
+    for module in net.modules():
+        if hasattr(module, 'entropy_bottleneck'):
+            module.entropy_bottleneck.update()
+        # 针对一些使用“gaussian_conditional”熵模型的架构（如bmshj2018-hyperprior）
+        elif hasattr(module, 'gaussian_conditional'):
+            module.gaussian_conditional.update()
+    # ===== 新增代码结束 =====
     
     print(f"✓ 已加载模型: {model_arch}, 权重来自: {checkpoint_path}")
     print(f"  训练epoch: {checkpoint.get('epoch', '未知')}, "
           f"验证损失: {checkpoint.get('loss', '未知'):.4f}")
     return net
 
-def test_model_on_image(model, image_path, output_dir="test_output", coder="ans"):
-    """用指定模型测试单张图像"""
+def test_model_on_image(model, image_path, output_dir="test_output", coder="ans", checkpoint_path=None):
+    """用指定模型测试单张图像
+    checkpoint_path: 模型权重文件路径，用于提取epoch信息命名文件
+    """
+
     # 设置熵编码器
     compressai.set_entropy_coder(coder)
     
@@ -122,8 +162,8 @@ def test_model_on_image(model, image_path, output_dir="test_output", coder="ans"
     
     x_hat = crop(out_dec["x_hat"], (h, w))
     
-    # 保存重建图像
-    reconstructed_filename = Path(image_path).stem + "_reconstructed.png"
+    # 保存重建图像（使用新的命名规则）
+    reconstructed_filename = f"epoch_{extract_epoch_from_checkpoint(checkpoint_path)}.png"
     reconstructed_path = os.path.join(output_dir, reconstructed_filename)
     
     rec_img = torch2img(x_hat)
@@ -196,11 +236,12 @@ def main():
         device=device
     )
     
-    # 2. 测试模型
+     # 2. 测试模型（现在传递了checkpoint_path参数）
     results = test_model_on_image(
         model=model,
         image_path=args.image,
-        output_dir=args.output_dir
+        output_dir=args.output_dir,
+        checkpoint_path=args.checkpoint  # 新增参数
     )
     
     print("\n" + "="*50)
